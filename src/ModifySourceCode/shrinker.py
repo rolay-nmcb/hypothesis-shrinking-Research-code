@@ -725,15 +725,28 @@ class Shrinker:
         return defaultdict(ChoiceTree)
 
     def step(self, shrink_pass: ShrinkPass, *, random_order: bool = False) -> bool:
+        """
+        Executes a single step of the given shrink pass.
+
+        执行给定收缩策略（shrink pass）的一个步骤。
+        此函数是收缩过程的“原子操作”，它利用 ChoiceTree 来探索状态空间。
+        """
         tree = self.shrink_pass_choice_trees[shrink_pass]
         if tree.exhausted:
+            # If the search tree for this pass is fully explored, we can't do anything more.
+            # 如果该 pass 对应的选择树已经遍历完毕，则直接返回 False，表示无法执行。
             return False
 
+        # Snapshot current stats to measure the cost/benefit of this specific step.
+        # 对当前的状态指标（收缩次数、调用次数、未对齐次数）进行快照，
+        # 这样我们就能计算出这一步具体消耗了多少资源以及产生了多少收益。
         initial_shrinks = self.shrinks
         initial_calls = self.calls
         initial_misaligned = self.misaligned
         size = len(self.shrink_target.choices)
         assert shrink_pass.name is not None
+        # Tell the engine what we are doing for debugging/reporting purposes.
+        # 告诉引擎我们即将执行哪个 pass，用于调试信息的输出。
         self.engine.explain_next_call_as(shrink_pass.name)
 
         if random_order:
@@ -742,11 +755,18 @@ class Shrinker:
             selection_order = prefix_selection_order(shrink_pass.last_prefix)
 
         try:
+            # Perform the actual step using the choice tree.
+            # The lambda function invokes the shrink pass logic (e.g., changing an integer value).
+            # 使用选择树执行实际的步骤。
+            # 这里的 lambda 函数调用具体的收缩逻辑，tree.step 会根据 selection_order 决定如何探索。
             shrink_pass.last_prefix = tree.step(
                 selection_order,
                 lambda chooser: shrink_pass.function(chooser),
             )
         finally:
+            # Update the stats for this pass object. This is used later to sort passes by effectiveness.
+            # 更新该 pass 对象的统计数据（调用了多少次函数，产生了多少次收缩，删除了多少数据等）。
+            # 这些数据稍后会被用来对 pass 进行排序，优先执行效率高的 pass。
             shrink_pass.calls += self.calls - initial_calls
             shrink_pass.misaligned += self.misaligned - initial_misaligned
             shrink_pass.shrinks += self.shrinks - initial_shrinks
@@ -756,7 +776,14 @@ class Shrinker:
 
     def fixate_shrink_passes(self, passes: list[ShrinkPass]) -> None:
         """Run steps from each pass in ``passes`` until the current shrink target
-        is a fixed point of all of them."""
+        is a fixed point of all of them.
+
+        This method iterates to a fixed point and so is idempontent - calling
+        it twice will have exactly the same effect as calling it once.
+        """
+        # 这个函数是贪婪收缩（Greedy Shrink）的核心循环。
+        # 它会不断运行传入的一系列收缩策略（passes），直到所有策略都无法再进一步缩小测试用例（达到不动点 Fixed Point）。
+
         any_ran = True
         while any_ran:
             any_ran = False
@@ -769,6 +796,10 @@ class Shrinker:
             # and deletes data, or it doesn't work. In that latter case we turn
             # it off for the rest of this loop through the passes, but will
             # try again once all of the passes have been run.
+
+            # 我们尝试在每次 pass 之后运行 remove_discarded 进行清理。
+            # 这是一个启发式操作：如果存在被丢弃的数据（discarded data），这步操作可以批量删除它们。
+            # 如果这步操作无效（can_discard 变为 False），我们在本次外层循环中就会暂时关闭它，以节省开销。
             can_discard = self.remove_discarded()
 
             calls_at_loop_start = self.calls
@@ -776,6 +807,9 @@ class Shrinker:
             # We keep track of how many calls can be made by a single step
             # without making progress and use this to test how much to pad
             # out self.max_stall by as we go along.
+
+            # 我们跟踪单个失败步骤可能会消耗多少次调用，并利用这个数据来动态调整 max_stall（最大停顿阈值）。
+            # 这样可以防止在遇到昂贵的失败步骤时过早停止收缩。
             max_calls_per_failing_step = 1
 
             for sp in passes:
@@ -787,6 +821,9 @@ class Shrinker:
                 # Run the shrink pass until it fails to make any progress
                 # max_failures times in a row. This implicitly boosts shrink
                 # passes that are more likely to work.
+
+                # 对当前的 pass 进行循环执行，直到它连续 max_failures 次都没能取得任何进展。
+                # 这种机制隐式地奖励了那些更有效的 pass（因为它们能运行更多次）。
                 failures = 0
                 max_failures = 20
                 while failures < max_failures:
@@ -798,6 +835,11 @@ class Shrinker:
                     # avoid that happening, we make sure that there's always
                     # plenty of breathing room to make it through a single
                     # iteration of the fixate_shrink_passes loop.
+
+                    # 动态预算管理：
+                    # 我们不允许连续失败超过 max_stall 次。
+                    # 但是为了防止因为 pass 顺序不好（好用的 pass 排在后面）导致提前退出，
+                    # 我们动态增加 max_stall，确保至少有足够的“预算”跑完当前的一轮循环。
                     self.max_stall = max(
                         self.max_stall,
                         2 * max_calls_per_failing_step
@@ -814,22 +856,33 @@ class Shrinker:
                     # to do anything) we switch to randomly jumping around. If we
                     # find a success then we'll resume deterministic order from
                     # there which, with any luck, is in a new good region.
+
+                    # 顺序切换策略：
+                    # 默认使用确定性顺序（prefix order）运行，因为这样避免重复且逻辑清晰。
+                    # 但如果发现陷入了停滞（failures 达到一半），为了打破僵局，我们会切换到随机顺序（random_order=True）。
+                    # 如果随机尝试成功了，failures 会重置，下次又会回到确定性顺序。
                     if not self.step(sp, random_order=failures >= max_failures // 2):
                         # step returns False when there is nothing to do because
                         # the entire choice tree is exhausted. If this happens
                         # we break because we literally can't run this pass any
                         # more than we already have until something else makes
                         # progress.
+
+                        # 如果 step 返回 False，说明该 pass 的搜索空间已经穷尽，无法再执行，直接跳出内层循环。
                         break
                     any_ran = True
 
                     # Don't count steps that didn't actually try to do
                     # anything as failures. Otherwise, this call is a failure
                     # if it failed to make any changes to the shrink target.
+
+                    # 如果 initial_calls 没有变化，说明 step 其实没做任何实际的测试调用（可能是空的步骤），这不算作失败。
                     if initial_calls != self.calls:
                         if prev is not self.shrink_target:
+                            # 成功收缩！重置失败计数器，允许该 pass 继续运行。
                             failures = 0
                         else:
+                            # 失败（目标没变）。记录这次失败消耗了多少调用，并增加失败计数。
                             max_calls_per_failing_step = max(
                                 max_calls_per_failing_step, self.calls - initial_calls
                             )
@@ -839,6 +892,12 @@ class Shrinker:
                 # we try good ones first. The rule is that shrink passes that
                 # did nothing useful are the worst, shrink passes that reduced
                 # the length are the best.
+
+                # 重新排序逻辑：
+                # 为了让下一轮外层循环更高效，我们根据 pass 的表现打分并排序：
+                # 1. (1分) 最差：跑了但没改变 shrink_target。
+                # 2. (0分) 中等：改变了 shrink_target，但长度没变（可能只是简化了值）。
+                # 3. (-1分) 最好：成功减少了 choice 序列的长度。
                 if self.shrink_target is before_sp:
                     reordering[sp] = 1
                 elif len(self.choices) < len(before_sp.choices):
@@ -846,6 +905,7 @@ class Shrinker:
                 else:
                     reordering[sp] = 0
 
+            # 根据上面的打分对 passes 进行排序，确保表现最好的 pass 在下一轮最先运行。
             passes.sort(key=reordering.__getitem__)
 
     @property
@@ -1606,13 +1666,24 @@ class Shrinker:
         but it fails when there is data that has to stay in particular places
         in the list.
         """
+        # 这个 shrink pass 的主要目的是尝试按顺序最小化每一个选择（choice）。
+        # 这是保证例如我们画出的每个整数都是其可能取值中的最小值的关键步骤。
+        # 比如：x = data.draw(integers()) assert x < 10
+        # 经过收缩后，x 应该是 10 而不是 97。
+
+        # 从当前节点列表中选择一个非平凡（trivial）的节点进行操作。
+        # trivial 节点通常指那些没有改变余地的节点（如只有一个可能值的选择）。
         node = chooser.choose(self.nodes, lambda node: not node.trivial)
         initial_target = self.shrink_target
 
+        # 首先尝试对选中的节点进行标准的最小化操作。
+        # 这通常涉及二分查找或其他策略来将值向 0 或 shrink_towards 移动。
         self.minimize_nodes([node])
         if self.shrink_target is not initial_target:
             # the shrink target changed, so our shrink worked. Defer doing
             # anything more intelligent until this shrink fails.
+            # 如果收缩目标（shrink_target）发生了变化，说明我们标准的最小化操作成功了。
+            # 此时直接返回，推迟执行更复杂的逻辑，直到这种简单的收缩不再起作用为止。
             return
 
         # the shrink failed. One particularly common case where minimizing a
@@ -1623,6 +1694,13 @@ class Shrinker:
         # the size of the generated input, we'll try deleting things after that
         # node and see if the resulting attempt works.
 
+        # 标准收缩失败了。这里处理一种特别常见的情况：
+        # 用户代码先抽取了一个大小（size），然后抽取了该大小的集合。
+        # 或者更一般地说，当某个单个节点决定了后续数据的大小时。
+        # 在这种情况下，单纯减小这个“大小节点”的值会导致后续数据过剩，从而可能导致测试用例无效或行为不一致。
+        # 这里的策略是：如果我们把这个整数节点减 1，并且这导致了生成的数据量减少，
+        # 那么我们尝试在减小该节点的同时，删除该节点之后的一些数据，看看能否构成一个有效的、更小的测试用例。
+
         if node.type != "integer":
             # Only try this fixup logic on integer draws. Almost all size
             # dependencies are on integer draws, and if it's not, it's doing
@@ -1631,33 +1709,48 @@ class Shrinker:
             # albeit convoluted example:
             # n = int(data.draw(st.floats()))
             # s = data.draw(st.lists(st.integers(), min_size=n, max_size=n))
+
+            # 仅在整数类型的节点上尝试这种“修复”逻辑。因为绝大多数大小依赖都基于整数。
             return
 
+        # 手动构造一个新的节点序列：将当前关注的整数节点的值减 1。
         lowered = (
-            self.nodes[: node.index]
-            + (node.copy(with_value=node.value - 1),)
-            + self.nodes[node.index + 1 :]
+                self.nodes[: node.index]
+                + (node.copy(with_value=node.value - 1),)
+                + self.nodes[node.index + 1:]
         )
+        # 使用 cached_test_function 测试这个“减 1”后的序列。
+        # [1] 是返回结果中的 ConjectureResult 或 Overrun 对象。
         attempt = self.cached_test_function(lowered)[1]
+
         if (
-            attempt is None
-            or attempt.status < Status.VALID
-            or len(attempt.nodes) == len(self.nodes)
-            or len(attempt.nodes) == node.index + 1
+                attempt is None
+                or attempt.status < Status.VALID
+                or len(attempt.nodes) == len(self.nodes)
+                or len(attempt.nodes) == node.index + 1
         ):
             # no point in trying our size-dependency-logic if our attempt at
             # lowering the node resulted in:
             # * an invalid conjecture data
             # * the same number of nodes as before
             # * no nodes beyond the lowered node (nothing to try to delete afterwards)
+
+            # 如果出现以下情况，尝试我们的大小依赖修复逻辑就没有意义了：
+            # 1. attempt 为空或状态无效（说明单纯减 1 导致了不可恢复的错误）。
+            # 2. 节点数量没变（len(attempt.nodes) == len(self.nodes)）：这意味着减小这个值并没有导致后续数据被“截断”或“遗弃”，说明它可能不是一个控制大小的变量。
+            # 3. 降低的节点后面没有其他节点了（len == index + 1）：后面没东西可删。
             return
 
         # If it were then the original shrink should have worked and we could
         # never have got here.
+        # 如果 attempt 直接成为了新的 shrink_target，说明上面的 minimize_nodes 应该就已经成功了，
+        # 我们不应该运行到这里。所以这里断言它还没有成功。
         assert attempt is not self.shrink_target
 
         @self.cached(node.index)
         def first_span_after_node():
+            # 辅助函数：使用二分查找找到位于当前节点之后的第一个 span 的索引。
+            # span 通常代表一个逻辑上的数据块（例如一个列表项）。
             lo = 0
             hi = len(self.spans)
             while lo + 1 < hi:
@@ -1673,17 +1766,25 @@ class Shrinker:
         # If we wanted to get more aggressive, we could try deleting n
         # consecutive nodes (that don't cross a span boundary) for say
         # n <= 2 or n <= 3.
+
+        # 我们尝试两种删除策略来配合“大小减 1”的操作：
+        # 1. 删除一个完整的 span（如果大小控制的是列表长度，这通常对应删除列表中的一项）。
+        # 2. 删除一个单独的节点（如果大小控制的是简单的字节序列或循环次数）。
         if chooser.choose([True, False]):
+            # 策略 1：删除该节点之后的一个完整 span。
             span = self.spans[
                 chooser.choose(
                     range(first_span_after_node, len(self.spans)),
                     lambda i: self.spans[i].choice_count > 0,
                 )
             ]
-            self.consider_new_nodes(lowered[: span.start] + lowered[span.end :])
+            # 尝试提交新节点序列：保留直到 span 开始的部分 + 跳过 span 的部分。
+            self.consider_new_nodes(lowered[: span.start] + lowered[span.end:])
         else:
+            # 策略 2：删除该节点之后的一个单独节点。
             node = self.nodes[chooser.choose(range(node.index + 1, len(self.nodes)))]
-            self.consider_new_nodes(lowered[: node.index] + lowered[node.index + 1 :])
+            # 尝试提交新节点序列：跳过选中的那个节点。
+            self.consider_new_nodes(lowered[: node.index] + lowered[node.index + 1:])
 
     def reorder_spans(self, chooser):
         """This pass allows us to reorder the children of each span.
