@@ -1,0 +1,9 @@
+调试代码
+
+testCode目录下面是被测试代码
+
+
+testByHypothesis目录下是使用Hypothesis进行测试的代码
+
+
+ModifySourceCode目录下是修改的shrinker.py源码（其实就是注释了minimize_individual_choices这个策略，让它不生效），以及对于step函数，fixate_shrink_passes函数等核心函数进行了详细中文注释，还对minimize_individual_choices这一个策略添加了中文注释从而了解约减算法
